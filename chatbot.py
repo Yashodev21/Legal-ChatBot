@@ -211,11 +211,16 @@ def ask_question(question):
 
         search_start = time.monotonic()
         logger.info("CHROMADB SEARCH STARTED")
+        logger.info("CHROMADB QUERY EXECUTING")
+
         results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=TOP_K,
-            include=["documents", "metadatas", "distances"],
-        )
+        query_embeddings=[query_embedding],
+        n_results=1,
+        include=["documents", "metadatas"],
+    )
+
+        logger.info("CHROMADB QUERY FINISHED")
+        
         documents = (results.get("documents") or [[]])[0]
         metadatas = (results.get("metadatas") or [[]])[0]
         search_time = time.monotonic() - search_start
