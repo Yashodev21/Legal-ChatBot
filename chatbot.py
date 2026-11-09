@@ -20,7 +20,10 @@ class ChatbotError(RuntimeError):
 # 1. CONFIGURATION
 # ==========================================
 
-CHAT_MODEL = "gemini-3.1-flash-lite"
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash-lite")
 EMBED_MODEL = "gemini-embedding-001"
 
 DB_PATH = "chroma_db_gemini"
@@ -29,8 +32,6 @@ COLLECTION_NAME = "legal_documents_gemini"
 TOP_K = 6
 MAX_TOKENS = 350
 API_TIMEOUT_MS = 12000
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
 
 
 # ==========================================
@@ -43,6 +44,20 @@ try:
     collection = client.get_collection(name=COLLECTION_NAME)
 except Exception:
     collection = None
+
+
+def get_health_status():
+    """Return non-secret runtime information for deployment health checks."""
+    count = 0
+    if collection is not None:
+        count = collection.count()
+    return {
+        "api_key_configured": bool(os.getenv("GEMINI_API_KEY")),
+        "chat_model": CHAT_MODEL,
+        "embedding_model": EMBED_MODEL,
+        "database_collection": COLLECTION_NAME,
+        "document_count": count,
+    }
 
 
 def _get_gemini_client():
