@@ -49,7 +49,7 @@ def ask():
         })
 
     except ChatbotError as error:
-        logger.exception("Chatbot request failed")
+        logger.error("Chatbot request failed: %s", error, exc_info=True)
         return jsonify({
             "error": str(error)
         }), 502

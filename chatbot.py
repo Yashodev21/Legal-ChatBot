@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 class ChatbotError(RuntimeError):
     """Raised when the legal assistant cannot complete a request."""
 
+
+class ChatbotConfigurationError(ChatbotError):
+    """Raised when deployment configuration is incomplete."""
+
+
+class ChatbotServiceError(ChatbotError):
+    """Raised when an external service cannot answer."""
+
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
@@ -63,7 +71,7 @@ def get_health_status():
 def _get_gemini_client():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError(
+        raise ChatbotConfigurationError(
             "GEMINI_API_KEY is not configured. Add it to the .env file or Render environment."
         )
     return genai.Client(
@@ -217,8 +225,14 @@ def ask_question(question):
         total_start = time.time()
 
         # Check database
-        if collection is None or collection.count() == 0:
-            return "The Gemini knowledge base is empty. Run build_database.py first."
+        if collection is None:
+            raise ChatbotConfigurationError(
+                "The Gemini knowledge base is not available in this deployment."
+            )
+        if collection.count() == 0:
+            raise ChatbotConfigurationError(
+                "The Gemini knowledge base is empty. Build and deploy it before asking questions."
+            )
 
         # --------------------------------------
         # 4. GENERATE QUESTION EMBEDDING
@@ -378,9 +392,16 @@ QUESTION:
         raise
     except Exception as error:
         logger.exception("Legal assistant request failed")
-        raise ChatbotError(
-            "The legal assistant is temporarily unavailable. Please try again."
-        ) from error
+        error_text = str(error).lower()
+        if "429" in error_text or "quota" in error_text or "resource_exhausted" in error_text:
+            message = "Gemini API quota is temporarily exceeded. Please try again later."
+        elif "404" in error_text or "not found" in error_text:
+            message = "The configured Gemini model is not available for this API project."
+        elif "timeout" in error_text or "timed out" in error_text:
+            message = "Gemini took too long to respond. Please try again."
+        else:
+            message = "The Gemini service could not answer this question. Check the Render logs."
+        raise ChatbotServiceError(message) from error
 
 
 # ==========================================
