@@ -132,7 +132,12 @@ def _is_ambiguous_section_query(question):
     )
 
 
-def _prioritize_numbered_provision(question, documents, metadatas):
+def _prioritize_numbered_provision(
+    question,
+    query_embedding,
+    documents,
+    metadatas,
+):
     match = re.search(r"\b(article|section)\s+(\d+[A-Za-z]?)\b", question, re.IGNORECASE)
     if not match:
         return documents, metadatas
@@ -145,7 +150,12 @@ def _prioritize_numbered_provision(question, documents, metadatas):
     if collection is None:
         return documents, metadatas
 
-    stored = collection.get(
+    if query_embedding is None:
+        return documents, metadatas
+
+    stored = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=min(TOP_K, collection.count()),
         where_document={"$contains": f"{provision_number}."},
         include=["documents", "metadatas"],
     )
@@ -153,8 +163,8 @@ def _prioritize_numbered_provision(question, documents, metadatas):
     exact_metadatas = []
 
     for document, metadata in zip(
-        stored.get("documents") or [],
-        stored.get("metadatas") or [],
+        (stored.get("documents") or [[]])[0],
+        (stored.get("metadatas") or [[]])[0],
     ):
         if document and exact_pattern.search(document):
             exact_documents.append(document)
@@ -172,40 +182,6 @@ def _prioritize_numbered_provision(question, documents, metadatas):
         if document not in exact_documents
     ]
     return combined_documents[:TOP_K], combined_metadatas[:TOP_K]
-
-
-def _lexical_retrieve(question):
-    """Retrieve stored chunks without calling the embedding API."""
-    if collection is None:
-        return [], []
-
-    stored = collection.get(include=["documents", "metadatas"])
-    documents = stored.get("documents") or []
-    metadatas = stored.get("metadatas") or []
-    terms = {
-        term.lower()
-        for term in re.findall(r"[A-Za-z0-9]+", question)
-        if len(term) >= 3
-    }
-    phrase = question.strip().lower()
-    scored = []
-
-    for index, document in enumerate(documents):
-        text = (document or "").lower()
-        score = sum(text.count(term) for term in terms)
-        if phrase and phrase in text:
-            score += 10
-        if "fundamental right" in phrase and "fundamental right" in text:
-            score += 20
-        if score:
-            scored.append((score, index))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    selected = [index for _, index in scored[:TOP_K]]
-    return (
-        [documents[index] for index in selected],
-        [metadatas[index] or {} for index in selected],
-    )
 
 
 def ask_question(question):
@@ -254,15 +230,23 @@ def ask_question(question):
 
             query_embedding = response.embeddings[0].values
             embedding_time = time.time() - embedding_start
-            used_fallback = False
         except Exception as error:
             embedding_time = time.time() - embedding_start
-            logger.warning(
-                "Gemini embedding unavailable; using lexical retrieval: %s",
-                type(error).__name__,
-            )
-            query_embedding = None
-            used_fallback = True
+            logger.exception("Gemini question embedding failed")
+            error_text = str(error).lower()
+            if "429" in error_text or "quota" in error_text:
+                message = (
+                    "Gemini embedding quota is temporarily exceeded. "
+                    "Please try again later."
+                )
+            elif "timeout" in error_text or "timed out" in error_text:
+                message = "Gemini embedding timed out. Please try again."
+            else:
+                message = (
+                    "Gemini could not create the question embedding. "
+                    "Check the Render logs."
+                )
+            raise ChatbotServiceError(message) from error
 
         # --------------------------------------
         # 5. SEARCH RELEVANT DOCUMENTS
@@ -272,16 +256,13 @@ def ask_question(question):
 
         search_start = time.time()
 
-        if used_fallback:
-            documents, metadatas = _lexical_retrieve(question)
-        else:
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=min(TOP_K, collection.count()),
-                include=["documents", "metadatas", "distances"]
-            )
-            documents = results["documents"][0] or []
-            metadatas = results["metadatas"][0] or []
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(TOP_K, collection.count()),
+            include=["documents", "metadatas", "distances"]
+        )
+        documents = results["documents"][0] or []
+        metadatas = results["metadatas"][0] or []
 
         search_time = time.time() - search_start
 
@@ -290,6 +271,7 @@ def ask_question(question):
 
         documents, metadatas = _prioritize_numbered_provision(
             question,
+            query_embedding,
             documents,
             metadatas,
         )
@@ -379,6 +361,13 @@ QUESTION:
         print(f"Search Time    : {search_time:.2f} seconds")
         print(f"Generation Time: {generation_time:.2f} seconds")
         print(f"Total Time     : {total_time:.2f} seconds")
+        logger.info(
+            "Legal request timings: embedding=%.2fs retrieval=%.2fs generation=%.2fs total=%.2fs",
+            embedding_time,
+            search_time,
+            generation_time,
+            total_time,
+        )
 
         print("=================================")
 
