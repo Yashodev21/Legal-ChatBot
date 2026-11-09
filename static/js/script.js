@@ -34,13 +34,25 @@ window.sendMessage = async function () {
     chatBox.scrollTop = chatBox.scrollHeight;
 
     try {
-        const response = await fetch("/ask", {
+        const response = await fetch(`${window.location.origin}/ask`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ question })
         });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || "Something went wrong.");
+        const contentType = response.headers.get("content-type") || "";
+        const data = contentType.includes("application/json")
+            ? await response.json()
+            : {};
+
+        if (!response.ok) {
+            throw new Error(
+                data.error || `Server error (${response.status}).`
+            );
+        }
+
+        if (typeof data.answer !== "string" || !data.answer.trim()) {
+            throw new Error("The server returned an empty answer.");
+        }
 
         const botMessage = document.createElement("div");
         botMessage.className = "message bot";
@@ -50,7 +62,10 @@ window.sendMessage = async function () {
     } catch (error) {
         const errorMessage = document.createElement("div");
         errorMessage.className = "message bot";
-        errorMessage.textContent = "Error: " + error.message;
+        const message = error.name === "TypeError"
+            ? "Unable to reach the Flask server. Confirm it is running and open this page from the Flask URL."
+            : error.message;
+        errorMessage.textContent = "Error: " + message;
         status.innerHTML = "";
         messages.appendChild(errorMessage);
     } finally {

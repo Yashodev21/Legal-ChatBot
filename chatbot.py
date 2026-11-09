@@ -1,25 +1,36 @@
 
 import chromadb
-import ollama
 import time
 import re
 import json
+import os
+import logging
 from pathlib import Path
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+logger = logging.getLogger(__name__)
+
+
+class ChatbotError(RuntimeError):
+    """Raised when the legal assistant cannot complete a request."""
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
 
-CHAT_MODEL = "qwen3:4b"
-EMBED_MODEL = "nomic-embed-text"
+CHAT_MODEL = "gemini-3.1-flash-lite"
+EMBED_MODEL = "gemini-embedding-001"
 
-DB_PATH = "chroma_db"
-COLLECTION_NAME = "legal_documents"
+DB_PATH = "chroma_db_gemini"
+COLLECTION_NAME = "legal_documents_gemini"
 
-TOP_K = 8
-MAX_TOKENS = 800
-CONTEXT_SIZE = 4096
+TOP_K = 6
+MAX_TOKENS = 350
+API_TIMEOUT_MS = 12000
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 
 # ==========================================
@@ -28,9 +39,25 @@ BASE_DIR = Path(__file__).resolve().parent
 
 client = chromadb.PersistentClient(path=str(BASE_DIR / DB_PATH))
 
-collection = client.get_collection(
-    name=COLLECTION_NAME
-)
+try:
+    collection = client.get_collection(name=COLLECTION_NAME)
+except Exception:
+    collection = None
+
+
+def _get_gemini_client():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured. Add it to the .env file or Render environment."
+        )
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=API_TIMEOUT_MS,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
 
 
 # ==========================================
@@ -71,6 +98,17 @@ def _clean_response(response):
     return response.strip()
 
 
+def _is_ambiguous_section_query(question):
+    return bool(
+        re.search(r"\bsection\s+\d+[A-Za-z]?\b", question, re.IGNORECASE)
+        and not re.search(
+            r"\b(bns|bharatiya\s+nyaya\s+sanhita|act|law)\b",
+            question,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _prioritize_numbered_provision(question, documents, metadatas):
     match = re.search(r"\b(article|section)\s+(\d+[A-Za-z]?)\b", question, re.IGNORECASE)
     if not match:
@@ -81,7 +119,13 @@ def _prioritize_numbered_provision(question, documents, metadatas):
         rf"(?<!\d){re.escape(provision_number)}\s*\.",
         re.IGNORECASE,
     )
-    stored = collection.get(include=["documents", "metadatas"])
+    if collection is None:
+        return documents, metadatas
+
+    stored = collection.get(
+        where_document={"$contains": f"{provision_number}."},
+        include=["documents", "metadatas"],
+    )
     exact_documents = []
     exact_metadatas = []
 
@@ -107,6 +151,40 @@ def _prioritize_numbered_provision(question, documents, metadatas):
     return combined_documents[:TOP_K], combined_metadatas[:TOP_K]
 
 
+def _lexical_retrieve(question):
+    """Retrieve stored chunks without calling the embedding API."""
+    if collection is None:
+        return [], []
+
+    stored = collection.get(include=["documents", "metadatas"])
+    documents = stored.get("documents") or []
+    metadatas = stored.get("metadatas") or []
+    terms = {
+        term.lower()
+        for term in re.findall(r"[A-Za-z0-9]+", question)
+        if len(term) >= 3
+    }
+    phrase = question.strip().lower()
+    scored = []
+
+    for index, document in enumerate(documents):
+        text = (document or "").lower()
+        score = sum(text.count(term) for term in terms)
+        if phrase and phrase in text:
+            score += 10
+        if "fundamental right" in phrase and "fundamental right" in text:
+            score += 20
+        if score:
+            scored.append((score, index))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = [index for _, index in scored[:TOP_K]]
+    return (
+        [documents[index] for index in selected],
+        [metadatas[index] or {} for index in selected],
+    )
+
+
 def ask_question(question):
 
     try:
@@ -115,11 +193,17 @@ def ask_question(question):
         if not question:
             return "Please enter a legal question."
 
+        if _is_ambiguous_section_query(question):
+            return (
+                "Which Act do you mean? Please specify the Bharatiya Nyaya Sanhita "
+                "or the relevant Act name."
+            )
+
         total_start = time.time()
 
         # Check database
-        if collection.count() == 0:
-            return "Your legal knowledge base is empty. Build the database first."
+        if collection is None or collection.count() == 0:
+            return "The Gemini knowledge base is empty. Run build_database.py first."
 
         # --------------------------------------
         # 4. GENERATE QUESTION EMBEDDING
@@ -129,15 +213,27 @@ def ask_question(question):
 
         embedding_start = time.time()
 
-        response = ollama.embed(
-            model=EMBED_MODEL,
-            input=question,
-            keep_alive="10m"
-        )
+        gemini = _get_gemini_client()
+        try:
+            response = gemini.models.embed_content(
+                model=EMBED_MODEL,
+                contents=question,
+            )
 
-        query_embedding = response["embeddings"][0]
+            if not response.embeddings or not response.embeddings[0].values:
+                raise RuntimeError("Gemini returned an invalid question embedding.")
 
-        embedding_time = time.time() - embedding_start
+            query_embedding = response.embeddings[0].values
+            embedding_time = time.time() - embedding_start
+            used_fallback = False
+        except Exception as error:
+            embedding_time = time.time() - embedding_start
+            logger.warning(
+                "Gemini embedding unavailable; using lexical retrieval: %s",
+                type(error).__name__,
+            )
+            query_embedding = None
+            used_fallback = True
 
         # --------------------------------------
         # 5. SEARCH RELEVANT DOCUMENTS
@@ -147,16 +243,18 @@ def ask_question(question):
 
         search_start = time.time()
 
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(TOP_K, collection.count()),
-            include=["documents", "metadatas", "distances"]
-        )
+        if used_fallback:
+            documents, metadatas = _lexical_retrieve(question)
+        else:
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=min(TOP_K, collection.count()),
+                include=["documents", "metadatas", "distances"]
+            )
+            documents = results["documents"][0] or []
+            metadatas = results["metadatas"][0] or []
 
         search_time = time.time() - search_start
-
-        documents = results["documents"][0] or []
-        metadatas = results["metadatas"][0] or []
 
         if not documents:
             return "No relevant information found in the legal documents."
@@ -187,18 +285,10 @@ def ask_question(question):
                 "Unknown page"
             )
 
-            context += f"""
-Source: {source}
-Page: {page}
-
-Content:
-{doc}
-
-------------------------------
-"""
+            context += f"Document chunk {i + 1}:\n{doc[:900]}\n\n"
 
         # --------------------------------------
-        # 7. GENERATE ANSWER USING QWEN3
+        # 7. GENERATE ANSWER USING GEMINI
         # --------------------------------------
 
         print("Generating legal answer...")
@@ -208,54 +298,27 @@ Content:
   
        
         prompt = f"""
-/no_think
+You are an Indian legal information assistant. Use only the context below.
+Return JSON only: {{"answer":"Article/Section - Act Name\\n\\nConcise answer."}}
+Do not include reasoning, source names, page numbers, or retrieval details.
+If the context is insufficient, say so. Never invent provisions.
 
-You are an Indian Legal Information Assistant.
-
-Answer the user's question using ONLY the provided legal context.
-
-STRICT INSTRUCTIONS:
-
-1. Return exactly one concise answer; do not show analysis or reasoning.
-2. Do not repeat the question or discuss the retrieval process.
-3. Do not list unrelated provisions.
-4. Mention relevant Article or Section numbers.
-5. Do not mention PDF names or page numbers.
-6. Do not invent legal information.
-7. If information is insufficient, say so directly.
-8. Use simple, understandable language.
-9. Keep the answer within 150 words.
-
-Return valid JSON only, in exactly this format:
-{{"answer": "Relevant Article or Section – Act Name\\n\\nDirect explanation in one or two short paragraphs."}}
-
-LEGAL CONTEXT:
+CONTEXT:
 {context}
 
-USER QUESTION:
+QUESTION:
 {question}
-
-FINAL ANSWER:
 """
 
 
-        answer = ollama.generate(
+        answer = gemini.models.generate_content(
             model=CHAT_MODEL,
-            prompt=prompt,
-            think=False,
-            keep_alive="10m",
-            format={
-                "type": "object",
-                "properties": {
-                    "answer": {"type": "string"}
-                },
-                "required": ["answer"]
-            },
-            options={
-                "temperature": 0.2,
-                "num_predict": MAX_TOKENS,
-                "num_ctx": CONTEXT_SIZE
-            }
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=MAX_TOKENS,
+                response_mime_type="application/json",
+            ),
         )
 
         generation_time = time.time() - generation_start
@@ -265,15 +328,14 @@ FINAL ANSWER:
         # 8. CLEAN MODEL RESPONSE
         # --------------------------------------
 
-        raw_response = _clean_response(answer.get("response", ""))
+        raw_response = _clean_response(answer.text or "")
 
         if not raw_response:
 
             print("Warning: Model returned an empty response.")
 
-            return (
-                "The model returned an empty answer. "
-                "Please check the Ollama model and debug output."
+            raise ChatbotError(
+                "Gemini returned an empty answer. Please try again."
             )
 
         # --------------------------------------
@@ -297,11 +359,13 @@ FINAL ANSWER:
 
         return raw_response.strip()
 
-    except Exception as e:
-
-        print("\nERROR:", str(e))
-
-        return f"An error occurred: {str(e)}"
+    except ChatbotError:
+        raise
+    except Exception as error:
+        logger.exception("Legal assistant request failed")
+        raise ChatbotError(
+            "The legal assistant is temporarily unavailable. Please try again."
+        ) from error
 
 
 # ==========================================

@@ -1,8 +1,11 @@
 
+import logging
+
 from flask import Flask, render_template, request, jsonify
-from chatbot import ask_question
+from chatbot import ChatbotError, ask_question
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
 @app.route("/")
 def home():
@@ -28,10 +31,17 @@ def ask():
             "answer": answer
         })
 
-    except Exception as e:
+    except ChatbotError as error:
+        logger.exception("Chatbot request failed")
+        return jsonify({
+            "error": str(error)
+        }), 502
+
+    except Exception:
+        logger.exception("Unexpected error in /ask")
 
         return jsonify({
-            "error": str(e)
+            "error": "The server could not process your request."
         }), 500
 
 
