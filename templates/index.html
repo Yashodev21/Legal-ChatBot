@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nyaya | Legal AI Assistant</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="app">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-mark">N</div>
+                <div><strong>NYAYA</strong><span>Legal intelligence</span></div>
+            </div>
+            <div class="sidebar-copy">
+                <span class="eyebrow">YOUR RESEARCH DESK</span>
+                <h1>Clarity for every legal question.</h1>
+                <p>Explore the Bharatiya Nyaya Sanhita and Constitution of India using your document library.</p>
+            </div>
+            <div class="library-card">
+                <div><strong>Document library</strong><small>BNS 2023 · Constitution of India</small></div>
+            </div>
+            <div class="sidebar-footer"><span>For information only</span><span>Not legal advice</span></div>
+        </aside>
+
+        <section class="workspace">
+            <header>
+                <div>
+                    <span class="eyebrow">LEGAL RESEARCH ASSISTANT</span>
+                    <h2>Ask Nyaya</h2>
+                    <p>Get clear answers grounded in your legal documents.</p>
+                </div>
+            </header>
+
+            <main id="chat-box">
+                <div class="welcome">
+                    <span class="welcome-icon">⚖</span>
+                    <div>
+                        <span class="eyebrow">WELCOME</span>
+                        <h3>How can I help you today?</h3>
+                        <p>Ask about an Article, Section, or legal concept from your library.</p>
+                    </div>
+                </div>
+                <div class="suggestions">
+                    <button class="suggestion" type="button" data-question="What does Article 14 of the Constitution of India provide?">Article 14 · Equality</button>
+                    <button class="suggestion" type="button" data-question="What is Section 1 of the Bharatiya Nyaya Sanhita?">BNS Section 1</button>
+                    <button class="suggestion" type="button" data-question="What is Article 297 of the Constitution of India?">Article 297 · Resources</button>
+                </div>
+                <div id="messages"></div>
+            </main>
+
+            <footer>
+                <div class="composer">
+                    <input type="text" id="question" placeholder="Ask a question about Indian law..." autocomplete="off">
+                    <button id="send-btn" type="button" aria-label="Send question">↑</button>
+                </div>
+                <div class="footer-note">Press Enter to send <span>•</span> Answers are based on your document library</div>
+                <div id="status"></div>
+            </footer>
+        </section>
+    </div>
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>
