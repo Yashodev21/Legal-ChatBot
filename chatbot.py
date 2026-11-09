@@ -1,4 +1,3 @@
-
 import chromadb
 import time
 import re
@@ -10,57 +9,98 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+# ==========================================
+# 1. LOGGING
+# ==========================================
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 logger = logging.getLogger(__name__)
 
 
+# ==========================================
+# 2. CUSTOM ERRORS
+# ==========================================
+
 class ChatbotError(RuntimeError):
-    """Raised when the legal assistant cannot complete a request."""
+    pass
 
 
 class ChatbotConfigurationError(ChatbotError):
-    """Raised when deployment configuration is incomplete."""
+    pass
 
 
 class ChatbotServiceError(ChatbotError):
-    """Raised when an external service cannot answer."""
+    pass
+
 
 # ==========================================
-# 1. CONFIGURATION
+# 3. CONFIGURATION
 # ==========================================
 
 BASE_DIR = Path(__file__).resolve().parent
+
 load_dotenv(BASE_DIR / ".env")
 
-CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.1-flash-lite")
+CHAT_MODEL = os.getenv(
+    "GEMINI_CHAT_MODEL",
+    "gemini-3.1-flash-lite"
+)
+
 EMBED_MODEL = "gemini-embedding-001"
 
-DB_PATH = "chroma_db_gemini"
+DB_PATH = BASE_DIR / "chroma_db_gemini"
+
 COLLECTION_NAME = "legal_documents_gemini"
 
-TOP_K = 6
-MAX_TOKENS = 350
-API_TIMEOUT_MS = 12000
+TOP_K = 4
+MAX_TOKENS = 300
+API_TIMEOUT_MS = 20000
 
 
 # ==========================================
-# 2. CONNECT TO CHROMADB
+# 4. CONNECT TO CHROMADB
 # ==========================================
 
-client = chromadb.PersistentClient(path=str(BASE_DIR / DB_PATH))
+logger.info("Connecting to ChromaDB...")
 
 try:
-    collection = client.get_collection(name=COLLECTION_NAME)
+    client = chromadb.PersistentClient(
+        path=str(DB_PATH)
+    )
+
+    collection = client.get_collection(
+        name=COLLECTION_NAME
+    )
+
+    logger.info(
+        "ChromaDB connected. Documents: %d",
+        collection.count()
+    )
+
 except Exception:
+    logger.exception("ChromaDB initialization failed")
     collection = None
 
 
+# ==========================================
+# 5. HEALTH STATUS
+# ==========================================
+
 def get_health_status():
-    """Return non-secret runtime information for deployment health checks."""
+
     count = 0
+
     if collection is not None:
         count = collection.count()
+
     return {
-        "api_key_configured": bool(os.getenv("GEMINI_API_KEY")),
+        "api_key_configured": bool(
+            os.getenv("GEMINI_API_KEY")
+        ),
         "chat_model": CHAT_MODEL,
         "embedding_model": EMBED_MODEL,
         "database_collection": COLLECTION_NAME,
@@ -68,259 +108,393 @@ def get_health_status():
     }
 
 
+# ==========================================
+# 6. GEMINI CLIENT
+# ==========================================
+
 def _get_gemini_client():
+
     api_key = os.getenv("GEMINI_API_KEY")
+
     if not api_key:
         raise ChatbotConfigurationError(
-            "GEMINI_API_KEY is not configured. Add it to the .env file or Render environment."
+            "GEMINI_API_KEY is not configured."
         )
+
     return genai.Client(
         api_key=api_key,
         http_options=types.HttpOptions(
             timeout=API_TIMEOUT_MS,
-            retry_options=types.HttpRetryOptions(attempts=1),
+            retry_options=types.HttpRetryOptions(
+                attempts=1
+            ),
         ),
     )
 
 
 # ==========================================
-# 3. ASK QUESTION FUNCTION
+# 7. RESPONSE CLEANING
 # ==========================================
 
 def _clean_response(response):
-    """Return only the model's final answer when reasoning is included."""
+
     response = response.strip()
 
     try:
         parsed = json.loads(response)
-        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
-            return parsed["answer"].strip()
+
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("answer"), str):
+                return parsed["answer"].strip()
+
     except json.JSONDecodeError:
         pass
 
     if "<think>" in response:
-        response = response.split("<think>", 1)[-1]
+
+        response = response.split(
+            "<think>", 1
+        )[-1]
+
         if "</think>" in response:
-            response = response.split("</think>", 1)[-1]
+            response = response.split(
+                "</think>", 1
+            )[-1]
 
     if "FINAL ANSWER:" in response:
-        response = response.split("FINAL ANSWER:", 1)[-1]
-    else:
-        final_markers = re.findall(
-            r"(?:Therefore|Thus|So),?\s+(?:the\s+)?answer\s+is:?\s*",
-            response,
-            flags=re.IGNORECASE,
-        )
-        if final_markers:
-            response = re.split(
-                r"(?:Therefore|Thus|So),?\s+(?:the\s+)?answer\s+is:?\s*",
-                response,
-                flags=re.IGNORECASE,
-            )[-1]
+        response = response.split(
+            "FINAL ANSWER:", 1
+        )[-1]
 
     return response.strip()
 
 
+# ==========================================
+# 8. AMBIGUOUS SECTION CHECK
+# ==========================================
+
 def _is_ambiguous_section_query(question):
+
     return bool(
-        re.search(r"\bsection\s+\d+[A-Za-z]?\b", question, re.IGNORECASE)
+        re.search(
+            r"\bsection\s+\d+[A-Za-z]?\b",
+            question,
+            re.IGNORECASE
+        )
         and not re.search(
             r"\b(bns|bharatiya\s+nyaya\s+sanhita|act|law)\b",
             question,
-            re.IGNORECASE,
+            re.IGNORECASE
         )
     )
 
+
+# ==========================================
+# 9. EXACT PROVISION RETRIEVAL
+# ==========================================
 
 def _prioritize_numbered_provision(
     question,
     query_embedding,
     documents,
-    metadatas,
+    metadatas
 ):
-    match = re.search(r"\b(article|section)\s+(\d+[A-Za-z]?)\b", question, re.IGNORECASE)
+
+    match = re.search(
+        r"\b(article|section)\s+(\d+[A-Za-z]?)\b",
+        question,
+        re.IGNORECASE
+    )
+
     if not match:
         return documents, metadatas
 
-    provision_number = match.group(2)
-    exact_pattern = re.compile(
-        rf"(?<!\d){re.escape(provision_number)}\s*\.",
-        re.IGNORECASE,
-    )
     if collection is None:
         return documents, metadatas
 
-    if query_embedding is None:
-        return documents, metadatas
+    provision_number = match.group(2)
 
-    stored = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(TOP_K, collection.count()),
-        where_document={"$contains": f"{provision_number}."},
-        include=["documents", "metadatas"],
+    exact_pattern = re.compile(
+        rf"(?<!\d){re.escape(provision_number)}\s*\.",
+        re.IGNORECASE
     )
-    exact_documents = []
-    exact_metadatas = []
 
-    for document, metadata in zip(
-        (stored.get("documents") or [[]])[0],
-        (stored.get("metadatas") or [[]])[0],
-    ):
-        if document and exact_pattern.search(document):
-            exact_documents.append(document)
-            exact_metadatas.append(metadata or {})
+    logger.info(
+        "EXACT PROVISION SEARCH STARTED: %s",
+        provision_number
+    )
 
-    if not exact_documents:
+    try:
+
+        stored = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(
+                TOP_K,
+                collection.count()
+            ),
+            where_document={
+                "$contains": f"{provision_number}."
+            },
+            include=[
+                "documents",
+                "metadatas"
+            ]
+        )
+
+        exact_documents = []
+        exact_metadatas = []
+
+        for document, metadata in zip(
+            (stored.get("documents") or [[]])[0],
+            (stored.get("metadatas") or [[]])[0]
+        ):
+
+            if document and exact_pattern.search(document):
+
+                exact_documents.append(document)
+
+                exact_metadatas.append(
+                    metadata or {}
+                )
+
+        logger.info(
+            "EXACT PROVISION SEARCH COMPLETED: %d matches",
+            len(exact_documents)
+        )
+
+        if not exact_documents:
+            return documents, metadatas
+
+        combined_documents = exact_documents + [
+            doc for doc in documents
+            if doc not in exact_documents
+        ]
+
+        combined_metadatas = exact_metadatas + [
+            metadata
+            for doc, metadata in zip(
+                documents,
+                metadatas
+            )
+            if doc not in exact_documents
+        ]
+
+        return (
+            combined_documents[:TOP_K],
+            combined_metadatas[:TOP_K]
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Exact provision retrieval failed"
+        )
+
         return documents, metadatas
 
-    combined_documents = exact_documents + [
-        document for document in documents if document not in exact_documents
-    ]
-    combined_metadatas = exact_metadatas + [
-        metadata
-        for document, metadata in zip(documents, metadatas)
-        if document not in exact_documents
-    ]
-    return combined_documents[:TOP_K], combined_metadatas[:TOP_K]
 
+# ==========================================
+# 10. MAIN QUESTION FUNCTION
+# ==========================================
 
 def ask_question(question):
+
+    total_start = time.monotonic()
 
     try:
 
         question = question.strip()
+
         if not question:
             return "Please enter a legal question."
 
         if _is_ambiguous_section_query(question):
+
             return (
-                "Which Act do you mean? Please specify the Bharatiya Nyaya Sanhita "
-                "or the relevant Act name."
+                "Which Act do you mean? Please specify "
+                "the Bharatiya Nyaya Sanhita or the "
+                "relevant Act name."
             )
 
-        total_start = time.time()
+        # ------------------------------
+        # DATABASE CHECK
+        # ------------------------------
 
-        # Check database
+        logger.info("DATABASE CHECK STARTED")
+
         if collection is None:
             raise ChatbotConfigurationError(
-                "The Gemini knowledge base is not available in this deployment."
+                "Legal knowledge base is unavailable."
             )
-        if collection.count() == 0:
+
+        document_count = collection.count()
+
+        if document_count == 0:
             raise ChatbotConfigurationError(
-                "The Gemini knowledge base is empty. Build and deploy it before asking questions."
+                "Legal knowledge base is empty."
             )
 
-        # --------------------------------------
-        # 4. GENERATE QUESTION EMBEDDING
-        # --------------------------------------
+        logger.info(
+            "DATABASE CHECK COMPLETED: %d chunks",
+            document_count
+        )
 
-        print("\nGenerating question embedding...")
+        # ------------------------------
+        # GEMINI CLIENT
+        # ------------------------------
 
-        embedding_start = time.time()
+        logger.info("GEMINI CLIENT INITIALIZATION STARTED")
 
         gemini = _get_gemini_client()
-        try:
-            response = gemini.models.embed_content(
-                model=EMBED_MODEL,
-                contents=question,
+
+        logger.info("GEMINI CLIENT INITIALIZATION COMPLETED")
+
+        # ------------------------------
+        # QUESTION EMBEDDING
+        # ------------------------------
+
+        embedding_start = time.monotonic()
+
+        logger.info("GEMINI EMBEDDING STARTED")
+
+        response = gemini.models.embed_content(
+            model=EMBED_MODEL,
+            contents=question
+        )
+
+        logger.info("GEMINI EMBEDDING RESPONSE RECEIVED")
+
+        if (
+            not response.embeddings
+            or not response.embeddings[0].values
+        ):
+            raise ChatbotServiceError(
+                "Gemini returned an invalid embedding."
             )
 
-            if not response.embeddings or not response.embeddings[0].values:
-                raise RuntimeError("Gemini returned an invalid question embedding.")
+        query_embedding = response.embeddings[0].values
 
-            query_embedding = response.embeddings[0].values
-            embedding_time = time.time() - embedding_start
-        except Exception as error:
-            embedding_time = time.time() - embedding_start
-            logger.exception("Gemini question embedding failed")
-            error_text = str(error).lower()
-            if "429" in error_text or "quota" in error_text:
-                message = (
-                    "Gemini embedding quota is temporarily exceeded. "
-                    "Please try again later."
-                )
-            elif "timeout" in error_text or "timed out" in error_text:
-                message = "Gemini embedding timed out. Please try again."
-            else:
-                message = (
-                    "Gemini could not create the question embedding. "
-                    "Check the Render logs."
-                )
-            raise ChatbotServiceError(message) from error
+        embedding_time = (
+            time.monotonic() - embedding_start
+        )
 
-        # --------------------------------------
-        # 5. SEARCH RELEVANT DOCUMENTS
-        # --------------------------------------
+        logger.info(
+            "GEMINI EMBEDDING COMPLETED: %.2f seconds",
+            embedding_time
+        )
 
-        print("Searching legal documents...")
+        # ------------------------------
+        # CHROMADB SEARCH
+        # ------------------------------
 
-        search_start = time.time()
+        search_start = time.monotonic()
+
+        logger.info("CHROMADB SEARCH STARTED")
 
         results = collection.query(
             query_embeddings=[query_embedding],
-            n_results=min(TOP_K, collection.count()),
-            include=["documents", "metadatas", "distances"]
+            n_results=min(
+                TOP_K,
+                document_count
+            ),
+            include=[
+                "documents",
+                "metadatas",
+                "distances"
+            ]
         )
-        documents = results["documents"][0] or []
-        metadatas = results["metadatas"][0] or []
 
-        search_time = time.time() - search_start
+        documents = (
+            results.get("documents") or [[]]
+        )[0]
+
+        metadatas = (
+            results.get("metadatas") or [[]]
+        )[0]
+
+        search_time = (
+            time.monotonic() - search_start
+        )
+
+        logger.info(
+            "CHROMADB SEARCH COMPLETED: %d results, %.2f seconds",
+            len(documents),
+            search_time
+        )
 
         if not documents:
-            return "No relevant information found in the legal documents."
+            return (
+                "No relevant information found "
+                "in the legal documents."
+            )
 
-        documents, metadatas = _prioritize_numbered_provision(
-            question,
-            query_embedding,
-            documents,
-            metadatas,
+        # ------------------------------
+        # EXACT SECTION / ARTICLE SEARCH
+        # ------------------------------
+
+        documents, metadatas = (
+            _prioritize_numbered_provision(
+                question,
+                query_embedding,
+                documents,
+                metadatas
+            )
         )
 
-        # --------------------------------------
-        # 6. BUILD CONTEXT
-        # --------------------------------------
+        # ------------------------------
+        # BUILD CONTEXT
+        # ------------------------------
 
-        context = ""
+        logger.info("CONTEXT BUILDING STARTED")
 
-        for i, doc in enumerate(documents):
+        context_parts = []
 
-            metadata = metadatas[i] or {}
+        for index, document in enumerate(documents):
 
-            source = metadata.get(
-                "source",
-                "Unknown document"
+            context_parts.append(
+                f"Document chunk {index + 1}:\n"
+                f"{document[:700]}"
             )
 
-            page = metadata.get(
-                "page",
-                "Unknown page"
-            )
+        context = "\n\n".join(context_parts)
 
-            context += f"Document chunk {i + 1}:\n{doc[:900]}\n\n"
+        logger.info(
+            "CONTEXT BUILDING COMPLETED: %d characters",
+            len(context)
+        )
 
-        # --------------------------------------
-        # 7. GENERATE ANSWER USING GEMINI
-        # --------------------------------------
+        # ------------------------------
+        # GEMINI ANSWER GENERATION
+        # ------------------------------
 
-        print("Generating legal answer...")
-
-        generation_start = time.time()
-
-  
-       
         prompt = f"""
-You are an Indian legal information assistant. Use only the context below.
-Return JSON only: {{"answer":"Article/Section - Act Name\\n\\nConcise answer."}}
-Do not include reasoning, source names, page numbers, or retrieval details.
-If the context is insufficient, say so. Never invent provisions.
+You are an Indian legal information assistant.
 
-CONTEXT:
+Use only the legal context provided below.
+
+RULES:
+1. Give a concise and accurate answer.
+2. Mention the correct Section or Article number.
+3. Mention the applicable Act name.
+4. Do not invent legal provisions.
+5. Do not reveal internal reasoning.
+6. Do not mention PDF names or page numbers.
+7. If the context is insufficient, clearly say so.
+8. Return valid JSON only.
+
+Required JSON format:
+{{"answer": "Section/Article - Act Name\\n\\nLegal answer."}}
+
+LEGAL CONTEXT:
 {context}
 
-QUESTION:
+USER QUESTION:
 {question}
 """
 
+        logger.info("GEMINI GENERATION STARTED")
+
+        generation_start = time.monotonic()
 
         answer = gemini.models.generate_content(
             model=CHAT_MODEL,
@@ -328,106 +502,131 @@ QUESTION:
             config=types.GenerateContentConfig(
                 temperature=0.2,
                 max_output_tokens=MAX_TOKENS,
-                response_mime_type="application/json",
-            ),
+                response_mime_type="application/json"
+            )
         )
 
-        generation_time = time.time() - generation_start
+        generation_time = (
+            time.monotonic() - generation_start
+        )
 
+        logger.info(
+            "GEMINI GENERATION COMPLETED: %.2f seconds",
+            generation_time
+        )
 
-        # --------------------------------------
-        # 8. CLEAN MODEL RESPONSE
-        # --------------------------------------
+        # ------------------------------
+        # CLEAN RESPONSE
+        # ------------------------------
 
-        raw_response = _clean_response(answer.text or "")
+        logger.info("RESPONSE CLEANING STARTED")
+
+        raw_response = _clean_response(
+            answer.text or ""
+        )
 
         if not raw_response:
 
-            print("Warning: Model returned an empty response.")
-
-            raise ChatbotError(
-                "Gemini returned an empty answer. Please try again."
+            raise ChatbotServiceError(
+                "Gemini returned an empty answer."
             )
 
-        # --------------------------------------
-        # 9. PERFORMANCE REPORT
-        # --------------------------------------
+        logger.info("RESPONSE CLEANING COMPLETED")
 
-        total_time = time.time() - total_start
+        # ------------------------------
+        # PERFORMANCE
+        # ------------------------------
 
-        print("\n========== PERFORMANCE ==========")
+        total_time = (
+            time.monotonic() - total_start
+        )
 
-        print(f"Embedding Time : {embedding_time:.2f} seconds")
-        print(f"Search Time    : {search_time:.2f} seconds")
-        print(f"Generation Time: {generation_time:.2f} seconds")
-        print(f"Total Time     : {total_time:.2f} seconds")
         logger.info(
-            "Legal request timings: embedding=%.2fs retrieval=%.2fs generation=%.2fs total=%.2fs",
+            "PERFORMANCE: embedding=%.2fs retrieval=%.2fs generation=%.2fs total=%.2fs",
             embedding_time,
             search_time,
             generation_time,
-            total_time,
+            total_time
         )
 
-        print("=================================")
-
-        # --------------------------------------
-        # 10. RETURN ANSWER
-        # --------------------------------------
-
-        return raw_response.strip()
+        return raw_response
 
     except ChatbotError:
         raise
+
     except Exception as error:
-        logger.exception("Legal assistant request failed")
+
+        logger.exception(
+            "LEGAL CHATBOT REQUEST FAILED"
+        )
+
         error_text = str(error).lower()
-        if "429" in error_text or "quota" in error_text or "resource_exhausted" in error_text:
-            message = "Gemini API quota is temporarily exceeded. Please try again later."
-        elif "404" in error_text or "not found" in error_text:
-            message = "The configured Gemini model is not available for this API project."
-        elif "timeout" in error_text or "timed out" in error_text:
-            message = "Gemini took too long to respond. Please try again."
+
+        if (
+            "429" in error_text
+            or "quota" in error_text
+            or "resource_exhausted" in error_text
+        ):
+
+            message = (
+                "Gemini API quota exceeded. "
+                "Please try again later."
+            )
+
+        elif (
+            "timeout" in error_text
+            or "timed out" in error_text
+        ):
+
+            message = (
+                "Gemini request timed out. "
+                "Please try again."
+            )
+
+        elif "404" in error_text:
+
+            message = (
+                "Configured Gemini model is unavailable."
+            )
+
         else:
-            message = "The Gemini service could not answer this question. Check the Render logs."
+
+            message = (
+                "The legal chatbot could not process "
+                "your question. Check server logs."
+            )
+
         raise ChatbotServiceError(message) from error
 
 
 # ==========================================
-# 11. MAIN CHAT INTERFACE
+# 11. TERMINAL TEST
 # ==========================================
 
 if __name__ == "__main__":
 
-    print("\n======================================")
-    print("          LEGAL RAG CHATBOT")
-    print("======================================")
-
+    print("\nLEGAL RAG CHATBOT")
     print("Model:", CHAT_MODEL)
     print("Embedding:", EMBED_MODEL)
 
-    print("\nType 'exit' to stop the chatbot.")
+    print("\nType 'exit' to stop.")
 
     while True:
 
-        question = input("\nAsk your legal question: ").strip()
+        question = input(
+            "\nAsk your legal question: "
+        ).strip()
 
         if question.lower() == "exit":
-
-            print("\nChatbot closed.")
             break
 
-        if not question:
+        try:
 
-            print("Please enter a question.")
-            continue
+            answer = ask_question(question)
 
-        print("\nProcessing your question...")
+            print("\nCHATBOT ANSWER:\n")
+            print(answer)
 
-        answer = ask_question(question)
+        except ChatbotError as error:
 
-        print("\n========== CHATBOT ANSWER ==========")
-
-        print(answer)
-
-        print("====================================")
+            print("\nERROR:", error)
